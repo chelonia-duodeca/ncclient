@@ -18,7 +18,7 @@ from uuid import uuid4
 from ncclient.xml_ import *
 from ncclient.logging_ import SessionLoggerAdapter
 from ncclient.transport import SessionListener
-
+from ncclient.operations import util
 from ncclient.operations.errors import OperationError, TimeoutExpiredError, MissingCapabilityError
 
 import logging
@@ -144,8 +144,9 @@ class RPCReply(object):
     ERROR_CLS = RPCError
     "Subclasses can specify a different error class, but it should be a subclass of `RPCError`."
 
-    def __init__(self, raw, huge_tree=False):
+    def __init__(self, raw, huge_tree=False, parsing_error_transform=None):
         self._raw = raw
+        self._parsing_error_transform = parsing_error_transform
         self._parsed = False
         self._root = None
         self._errors = []
@@ -167,12 +168,26 @@ class RPCReply(object):
                 for err in root.getiterator(error.tag):
                     # Process a particular <rpc-error>
                     self._errors.append(self.ERROR_CLS(err))
-        self._parsing_hook(root)
+        try:
+            self._parsing_hook(root)
+        except Exception as e:
+            if self._parsing_error_transform is None:
+                # re-raise as we have no workaround
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                six.reraise(exc_type, exc_value, exc_traceback)
+
+            # Apply device specific workaround and try again
+            self._parsing_error_transform(root)
+            self._parsing_hook(root)
+
         self._parsed = True
 
     def _parsing_hook(self, root):
         "No-op by default. Gets passed the *root* element for the reply."
         pass
+
+    def set_parsing_error_transform(self, transform_function):
+        self._parsing_error_transform = transform_function
 
     @property
     def xml(self):
@@ -381,6 +396,13 @@ class RPC(object):
     def deliver_reply(self, raw):
         # internal use
         self._reply = self.REPLY_CLS(raw, huge_tree=self._huge_tree)
+
+        # Set the reply_parsing_error transform outside the constructor, to keep compatibility for
+        # third party reply classes outside of ncclient
+        self._reply.set_parsing_error_transform(
+            self._device_handler.reply_parsing_error_transform(self.REPLY_CLS)
+        )
+
         self._event.set()
 
     def deliver_error(self, err):
@@ -452,3 +474,48 @@ class RPC(object):
     @huge_tree.setter
     def huge_tree(self, x):
         self._huge_tree = x
+
+class GenericRPC(RPC):
+    """Generic rpc commands wrapper"""
+    REPLY_CLS = RPCReply
+    """See :class:`RPCReply`."""
+
+    def request(self, rpc_command, source=None, filter=None, config=None, target=None, format=None):
+        """
+        *rpc_command* specifies rpc command to be dispatched either in plain text or in xml element format (depending on command)
+
+        *target* name of the configuration datastore being edited
+
+        *source* name of the configuration datastore being queried
+
+        *config* is the configuration, which must be rooted in the `config` element. It can be specified either as a string or an :class:`~xml.etree.ElementTree.Element`.
+
+        *filter* specifies the portion of the configuration to retrieve (by default entire configuration is retrieved)
+
+        :seealso: :ref:`filter_params`
+
+        Examples of usage::
+
+            m.rpc('rpc_command')
+
+        or dispatch element like ::
+
+            rpc_command = new_ele('get-xnm-information')
+            sub_ele(rpc_command, 'type').text = "xml-schema"
+            m.rpc(rpc_command)
+        """
+
+        if etree.iselement(rpc_command):
+            node = rpc_command
+        else:
+            node = new_ele(rpc_command)
+        if target is not None:
+            node.append(util.datastore_or_url("target", target, self._assert))
+        if source is not None:
+            node.append(util.datastore_or_url("source", source, self._assert))
+        if filter is not None:
+            node.append(util.build_filter(filter))
+        if config is not None:
+            node.append(validated_element(config, ("config", qualify("config"))))
+
+        return self._request(node)

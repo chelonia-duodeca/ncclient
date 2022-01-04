@@ -46,9 +46,9 @@ PORT_NETCONF_DEFAULT = 830
 
 BUF_SIZE = 4096
 # v1.0: RFC 4742
-MSG_DELIM = "]]>]]>"
+MSG_DELIM = b"]]>]]>"
 # v1.1: RFC 6242
-END_DELIM = '\n##\n'
+END_DELIM = b'\n##\n'
 
 TICK = 0.1
 
@@ -84,13 +84,6 @@ def _colonify(fp):
         finga += ":" + fp[idx:idx+2]
     return finga
 
-
-if sys.version < '3':
-    def textify(buf):
-        return buf
-else:
-    def textify(buf):
-        return buf.decode('UTF-8')
 
 if sys.version < '3':
     from six import StringIO
@@ -183,7 +176,10 @@ class SSHSession(Session):
             look_for_keys       = True,
             ssh_config          = None,
             sock_fd             = None,
-            bind_addr           = None):
+            bind_addr           = None,
+            sock                = None,
+            keepalive           = None,
+            environment         = None):
 
         """Connect via SSH and initialize the NETCONF session. First attempts the publickey authentication method and then password authentication.
 
@@ -216,9 +212,15 @@ class SSHSession(Session):
         *sock_fd* is an already open socket which shall be used for this connection. Useful for NETCONF outbound ssh. Use host=None together with a valid sock_fd number
 
         *bind_addr* is a (local) source IP address to use, must be reachable from the remote device.
+        
+        *sock* is an already open Python socket to be used for this connection.
+
+        *keepalive* Turn on/off keepalive packets (default is off). If this is set, after interval seconds without sending any data over the connection, a "keepalive" packet will be sent (and ignored by the remote host). This can be useful to keep connections alive over a NAT.
+
+        *environment* a dictionary containing the name and respective values to set
         """
-        if not (host or sock_fd):
-            raise SSHError("Missing host or socket fd")
+        if not (host or sock_fd or sock):
+            raise SSHError("Missing host, socket or socket fd")
 
         self._host = host
 
@@ -250,19 +252,22 @@ class SSHSession(Session):
                 username = config.get("user")
             if key_filename is None:
                 key_filename = config.get("identityfile")
-            if hostkey_verify:
-                userknownhostsfile = config.get("userknownhostsfile")
-                if userknownhostsfile:
-                    self.load_known_hosts(os.path.expanduser(userknownhostsfile))
             if timeout is None:
                 timeout = config.get("connecttimeout")
                 if timeout:
                     timeout = int(timeout)
 
+        if hostkey_verify:
+            userknownhostsfile = config.get("userknownhostsfile")
+            if userknownhostsfile:
+                self.load_known_hosts(os.path.expanduser(userknownhostsfile))
+            else:
+                self.load_known_hosts()
+
         if username is None:
             username = getpass.getuser()
 
-        if sock_fd is None:
+        if sock_fd is None and sock is None:
             proxycommand = config.get("proxycommand")
             if proxycommand:
                 self.logger.debug("Configuring Proxy. %s", proxycommand)
@@ -289,7 +294,7 @@ class SSHSession(Session):
                     break
                 else:
                     raise SSHError("Could not open socket to %s:%s" % (host, port))
-        else:
+        elif sock is None:
             if sys.version_info[0] < 3:
                 s = socket.fromfd(int(sock_fd), socket.AF_INET, socket.SOCK_STREAM)
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, _sock=s)
@@ -330,10 +335,10 @@ class SSHSession(Session):
         except paramiko.SSHException as e:
             raise SSHError('Negotiation failed: %s' % e)
 
-        server_key_obj = self._transport.get_remote_server_key()
-        fingerprint = _colonify(hexlify(server_key_obj.get_fingerprint()))
-
         if hostkey_verify:
+            server_key_obj = self._transport.get_remote_server_key()
+            fingerprint = _colonify(hexlify(server_key_obj.get_fingerprint()))
+
             is_known_host = False
 
             # For looking up entries for nonstandard (22) ssh ports in known_hosts
@@ -364,6 +369,9 @@ class SSHSession(Session):
         self._connected = True      # there was no error authenticating
         self._closing.clear()
 
+        if keepalive:
+            self._transport.set_keepalive(keepalive)
+
         # TODO: leopoul: Review, test, and if needed rewrite this part
         subsystem_names = self._device_handler.get_ssh_subsystem_names()
         for subname in subsystem_names:
@@ -371,6 +379,17 @@ class SSHSession(Session):
             self._channel_id = self._channel.get_id()
             channel_name = "%s-subsystem-%s" % (subname, str(self._channel_id))
             self._channel.set_name(channel_name)
+            if environment:
+                try:
+                    self._channel.update_environment(environment)
+                except paramiko.SSHException as e:
+                    self.logger.info("%s (environment update rejected)", e)
+                    handle_exception = self._device_handler.handle_connection_exceptions(self)
+                    # Ignore the exception, since we continue to try the different
+                    # subsystem names until we find one that can connect.
+                    # have to handle exception for each vendor here
+                    if not handle_exception:
+                        continue
             try:
                 self._channel.invoke_subsystem(subname)
             except paramiko.SSHException as e:
@@ -469,7 +488,7 @@ class SSHSession(Session):
         chan = self._channel
         q = self._q
 
-        def start_delim(data_len): return '\n#%s\n' % (data_len)
+        def start_delim(data_len): return b'\n#%i\n' % (data_len)
 
         try:
             s = selectors.DefaultSelector()
@@ -498,11 +517,11 @@ class SSHSession(Session):
                         raise SessionCloseError(self._buffer.getvalue())
                 if not q.empty() and chan.send_ready():
                     self.logger.debug("Sending message")
-                    data = q.get()
+                    data = q.get().encode()
                     if self._base == NetconfBase.BASE_11:
-                        data = "%s%s%s" % (start_delim(len(data)), data, END_DELIM)
+                        data = b"%s%s%s" % (start_delim(len(data)), data, END_DELIM)
                     else:
-                        data = "%s%s" % (data, MSG_DELIM)
+                        data = b"%s%s" % (data, MSG_DELIM)
                     self.logger.info("Sending:\n%s", data)
                     while data:
                         n = chan.send(data)

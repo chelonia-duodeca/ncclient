@@ -1,7 +1,11 @@
+# -*- coding: utf-8 -*-
 import unittest
-from mock import MagicMock, patch
+try:
+    from unittest.mock import MagicMock, patch, call  # Python 3.4 and later
+except ImportError:
+    from mock import MagicMock, patch, call
 from ncclient.transport.ssh import SSHSession
-from ncclient.transport import AuthenticationError, SessionCloseError
+from ncclient.transport import AuthenticationError, SessionCloseError, NetconfBase
 import paramiko
 from ncclient.devices.junos import JunosDeviceHandler
 import sys
@@ -277,6 +281,46 @@ class TestSSH(unittest.TestCase):
         obj.load_known_hosts()
         mock_load.assert_called_with("file_name")
 
+    @patch('ncclient.transport.ssh.hexlify')
+    @patch('os.path.expanduser')
+    @patch('paramiko.HostKeys')
+    @patch('paramiko.Transport')
+    @patch('ncclient.transport.ssh.SSHSession._post_connect')
+    @patch('ncclient.transport.ssh.SSHSession._auth')
+    def test_ssh_known_hosts(self, mock_auth, mock_pc,
+                             mock_transport, mock_hk,
+                             mock_os, mock_hex):
+        mock_os.return_value = "file_name"
+        hk_inst = MagicMock(check=MagicMock(return_value=True))
+        mock_hk.return_value = hk_inst
+        device_handler = JunosDeviceHandler({'name': 'junos'})
+        obj = SSHSession(device_handler)
+        obj.connect(host='h', sock=MagicMock())
+        hk_inst.load.assert_called_once_with('file_name')
+        mock_os.assert_called_once_with('~/.ssh/known_hosts')
+
+    @patch('ncclient.transport.ssh.hexlify')
+    @patch('ncclient.transport.ssh.open')
+    @patch('os.path.expanduser')
+    @patch('paramiko.HostKeys')
+    @patch('paramiko.Transport')
+    @patch('paramiko.SSHConfig')
+    @patch('ncclient.transport.ssh.SSHSession._post_connect')
+    @patch('ncclient.transport.ssh.SSHSession._auth')
+    def test_ssh_known_hosts_2(self, mock_auth, mock_pc,
+                               mock_sshc, mock_transport, mock_hk,
+                               mock_os, mock_open, mock_hex):
+        mock_os.return_value = "file_name"
+        hk_inst = MagicMock(check=MagicMock(return_value=True))
+        mock_hk.return_value = hk_inst
+        config = {'userknownhostsfile': 'known_hosts_file'}
+        mock_sshc.return_value = MagicMock(lookup=lambda _h: config)
+        device_handler = JunosDeviceHandler({'name': 'junos'})
+        obj = SSHSession(device_handler)
+        obj.connect(host='h', sock=MagicMock(), ssh_config=True)
+        hk_inst.load.assert_called_once_with('file_name')
+        mock_os.mock_calls == [call('~/.ssh/config'), call('known_hosts_file')]
+
     @unittest.skipIf(sys.version_info.major == 2, "test not supported < Python3")
     @patch('ncclient.transport.ssh.SSHSession.close')
     @patch('paramiko.channel.Channel.recv')
@@ -295,21 +339,36 @@ class TestSSH(unittest.TestCase):
                 SessionCloseError))
 
     @unittest.skipIf(sys.version_info.major == 2, "test not supported < Python3")
+    def test_run_send_py3_10(self):
+        self._test_run_send_py3(NetconfBase.BASE_10,
+                                lambda msg: msg.encode() + b"]]>]]>")
+
+    @unittest.skipIf(sys.version_info.major == 2, "test not supported < Python3")
+    def test_run_send_py3_11(self):
+        def chunker(msg):
+            encmsg = msg.encode()
+            chunks = b"\n#%i\n%b\n##\n" % (len(encmsg), encmsg)
+            return chunks
+        self._test_run_send_py3(NetconfBase.BASE_11, chunker)
+
     @patch('ncclient.transport.ssh.SSHSession.close')
     @patch('paramiko.channel.Channel.send_ready')
     @patch('paramiko.channel.Channel.send')
     @patch('selectors.DefaultSelector.select')
     @patch('ncclient.transport.ssh.Session._dispatch_error')
-    def test_run_send_py3(self, mock_error, mock_selector, mock_send, mock_ready, mock_close):
+    def _test_run_send_py3(self, base, chunker, mock_error, mock_selector,
+                           mock_send, mock_ready, mock_close):
         mock_selector.return_value = False
         mock_ready.return_value = True
         mock_send.return_value = -1
         device_handler = JunosDeviceHandler({'name': 'junos'})
         obj = SSHSession(device_handler)
         obj._channel = paramiko.Channel("c100")
-        obj._q.put("rpc")
+        msg = "naïve garçon"
+        obj._q.put(msg)
+        obj._base = base
         obj.run()
-        self.assertEqual(mock_send.call_args_list[0][0][0], "rpc]]>]]>")
+        self.assertEqual(mock_send.call_args_list[0][0][0], chunker(msg))
         self.assertTrue(
             isinstance(
                 mock_error.call_args_list[0][0][0],

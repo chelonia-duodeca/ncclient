@@ -1,6 +1,9 @@
 from ncclient.operations.edit import *
 import unittest
-from mock import patch, MagicMock
+try:
+    from unittest.mock import patch, MagicMock  # Python 3.4 and later
+except ImportError:
+    from mock import patch, MagicMock
 from ncclient import manager
 import ncclient.manager
 import ncclient.transport
@@ -69,6 +72,37 @@ class TestEdit(unittest.TestCase):
         call = mock_request.call_args_list[0][0][0]
         call = ElementTree.tostring(call)
         self.assertEqual(call, xml)
+
+    @patch('ncclient.operations.edit.RPC._request')
+    @patch('ncclient.operations.edit.RPC._assert')
+    def test_edit_config_valid_url(self, mock_assert, mock_request):
+        session = ncclient.transport.SSHSession(self.device_handler)
+        obj = EditConfig(
+            session,
+            self.device_handler,
+            raise_mode=RaiseMode.ALL)
+        config = "https://www.xxx.org/index.html"
+        obj.request(config, format='url')
+        node = new_ele("edit-config")
+        node.append(util.datastore_or_url("target", "candidate"))
+        sub_ele(node, "url").text = config
+
+        xml = ElementTree.tostring(node)
+        call = mock_request.call_args_list[0][0][0]
+        call = ElementTree.tostring(call)
+        self.assertEqual(call, xml)
+
+    @patch('ncclient.operations.edit.RPC._request')
+    @patch('ncclient.operations.edit.RPC._assert')
+    def test_edit_config_invalid_url(self, mock_assert, mock_request):
+        session = ncclient.transport.SSHSession(self.device_handler)
+        obj = EditConfig(
+            session,
+            self.device_handler,
+            raise_mode=RaiseMode.ALL)
+        config = "Invalid URL"
+        self.assertRaises(OperationError, obj.request,
+                          config, format='url')
 
     def test_edit_config_invalid_arguments_exception(self):
         session = ncclient.transport.SSHSession(self.device_handler)
