@@ -30,13 +30,10 @@ jobs:
           nosetests test --rednose --verbosity=3 --with-coverage --cover-package ncclient
 
       - name: Upload Coverage
-        uses: coverallsapp/github-action@master
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-        # env:
-        #   COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
-        # run: |
-        #   coveralls
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          coveralls --service=github
 
   # coveralls_finish:
   #   needs: check
