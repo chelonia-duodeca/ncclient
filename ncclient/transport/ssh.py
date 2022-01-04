@@ -134,15 +134,7 @@ class SSHSession(Session):
 
         if filename is None:
             filename = os.path.expanduser('~/.ssh/known_hosts')
-            try:
-                self._host_keys.load(filename)
-            except IOError:
-                # for windows
-                filename = os.path.expanduser('~/ssh/known_hosts')
-                try:
-                    self._host_keys.load(filename)
-                except IOError:
-                    pass
+            self._host_keys.load(filename)
         else:
             self._host_keys.load(filename)
 
